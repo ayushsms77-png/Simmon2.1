@@ -198,7 +198,26 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         if (__DEV__) console.log('[playback] started', track.title);
         LibraryService.recordPlay(track);
         // Warm exactly one track ahead, so pressing skip is instant.
-        preloader.schedule(queueRef.current.peekNext());
+        const upcoming = queueRef.current.peekNext();
+        preloader.schedule(upcoming);
+        // Also put it into RNTP's own real queue once resolved, so the
+        // lock-screen Next button renders enabled and Previous stops just
+        // restarting the current track (see PlaybackEngine.queueNext). This
+        // reuses MusicService's own de-duped/cached resolve — the preload
+        // line above and this one do not cause two separate network fetches.
+        if (upcoming) {
+          MusicService.resolveStream(upcoming)
+            .then((nextStream) => {
+              // Only apply if this load() is still the current one and the
+              // queue has not moved on in the meantime.
+              if (id === loadId.current && queueRef.current.peekNext()?.id === upcoming.id) {
+                playbackEngine.queueNext(upcoming, nextStream);
+              }
+            })
+            .catch(() => {
+              // Best-effort — the OS button simply stays as it was.
+            });
+        }
       } catch (e) {
         if (id !== loadId.current) return;
         // Always leave the loading state, whatever went wrong.
