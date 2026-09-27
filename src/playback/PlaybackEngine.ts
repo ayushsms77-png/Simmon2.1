@@ -139,18 +139,6 @@ export class PlaybackEngine {
     );
 
     this.eventSubs.push(
-      TrackPlayer.addEventListener(Event.MediaItemTransition, ({ item }) => {
-        // Fires when the active queue item changes to null — since we only
-        // ever load one item at a time, that means it finished with nothing
-        // queued after it.
-        if (!item && !this.completionFired) {
-          this.completionFired = true;
-          this.listeners.onComplete?.();
-        }
-      })
-    );
-
-    this.eventSubs.push(
       TrackPlayer.addEventListener(Event.RemoteNext, () => {
         this.listeners.onRemoteNext?.();
       })
@@ -189,6 +177,17 @@ export class PlaybackEngine {
   }
 
   private handlePlaybackStateChanged(state: PlaybackState): void {
+    // PATCH: the correct "track finished" signal for a single-item queue is
+    // PlaybackState.Ended — the previous version watched for
+    // MediaItemTransition firing with a null item instead, which only
+    // happens when a NEXT queued item is removed/skipped past, not when a
+    // lone track simply plays to the end. That's why playback was stopping
+    // silently instead of advancing: onComplete was never being called.
+    if (state === PlaybackState.Ended && !this.completionFired) {
+      this.completionFired = true;
+      this.listeners.onComplete?.();
+    }
+
     // PlaybackState here is Idle | Ready | Buffering | Ended | Error —
     // "is it playing" is tracked separately via IsPlayingChanged above.
     const isBuffering = state === PlaybackState.Buffering;
