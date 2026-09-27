@@ -209,6 +209,65 @@ export class PlaybackEngine {
     }
   }
 
+  private toMediaItem(track: Track, stream: ResolvedStream) {
+    // headers live nested under `url`, not as a sibling field — confirmed
+    // against the real MediaItem type, not the library's own docs (which
+    // didn't show this at all).
+    return {
+      mediaId: track.id,
+      url: { uri: stream.url, headers: stream.headers },
+      title: track.title,
+      artist: track.artist.name,
+      albumTitle: track.album,
+      artworkUrl: track.albumImageUrl || undefined,
+    };
+  }
+
+  /**
+   * Put a real, resolved track into RNTP's queue right after whatever is
+   * currently playing — WITHOUT touching current playback.
+   *
+   * This is the fix for the lock-screen Next button being disabled and
+   * Previous just restarting the current track: RNTP renders those controls
+   * based on whether a real "next" item genuinely exists in its own native
+   * queue, not on which PlayerCommand capabilities were declared. Since
+   * load() only ever puts ONE item in that queue, RNTP correctly reported
+   * "no next" — this appends the second, real one.
+   *
+   * The actual *decision* of what to advance to, TasteService recording,
+   * related-track extension when the queue is nearly empty, etc. all still
+   * live in usePlayer.tsx exactly as before — pressing Next still calls the
+   * app's own next(), same as always (see the onRemoteNext wiring above).
+   * This method exists purely so the button shows up correctly and Previous
+   * stops just restarting the current track; it does not change who decides
+   * what plays.
+   */
+  queueNext(track: Track, stream: ResolvedStream): void {
+    if (!this.configured) return;
+
+    try {
+      const activeIndex = TrackPlayer.getActiveMediaItemIndex();
+      if (activeIndex === null) return; // nothing is currently loaded
+
+      const queue = TrackPlayer.getQueue();
+      const nextIndex = activeIndex + 1;
+      const item = this.toMediaItem(track, stream);
+
+      if (nextIndex < queue.length) {
+        // Something is already queued there — only touch it if it is not
+        // already the same track, to avoid an unnecessary reload/flicker.
+        if (queue[nextIndex]?.mediaId !== track.id) {
+          TrackPlayer.replaceMediaItem(nextIndex, item);
+        }
+      } else {
+        TrackPlayer.insertMediaItem(nextIndex, item);
+      }
+    } catch {
+      // Best-effort: worst case the Next button stays as it was: still
+      // functional via onRemoteNext, just possibly shown disabled.
+    }
+  }
+
   /** Load a resolved stream and begin playing it. */
   async load(
     track: Track,
@@ -227,21 +286,11 @@ export class PlaybackEngine {
       this.status = { ...IDLE_STATUS, isBuffering: true, volume: this.desiredVolume };
       this.listeners.onStatus?.(this.status);
 
-      // setMediaItems() replaces the whole queue with this one track,
-      // matching the old engine's "one track at a time" contract exactly.
-      // headers live nested under `url`, not as a sibling field — confirmed
-      // against the real MediaItem type, not the library's own docs (which
-      // didn't show this at all).
-      TrackPlayer.setMediaItems([
-        {
-          mediaId: track.id,
-          url: { uri: stream.url, headers: stream.headers },
-          title: track.title,
-          artist: track.artist.name,
-          albumTitle: track.album,
-          artworkUrl: track.albumImageUrl || undefined,
-        },
-      ]);
+      // setMediaItems() replaces the whole queue with this one track. This
+      // also implicitly clears any track queueNext() had appended for the
+      // PREVIOUS current track — starting a fresh load() always means a
+      // fresh, correct queue, never a stale leftover "next" item.
+      TrackPlayer.setMediaItems([this.toMediaItem(track, stream)]);
       TrackPlayer.setVolume(this.desiredVolume);
 
       // If the source never loads, surface a real error instead of hanging.
