@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Animated,
   Linking,
   ScrollView,
   StyleSheet,
@@ -22,6 +23,7 @@ import {
   Package,
   Shield,
   Bot,
+  ArrowUpRight,
 } from 'lucide-react-native';
 import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -31,7 +33,6 @@ import { COLORS, SIZES, FONTS } from '../constants/theme';
 import { Header } from '../components/common/Header';
 import { StatCard } from '../components/common/StatCard';
 import { ListRow } from '../components/common/ListRow';
-import { FlowerMark } from '../components/common/FlowerMark';
 import { Gender } from '../services/LibraryService';
 import { useLibrary } from '../hooks/useLibrary';
 
@@ -63,7 +64,7 @@ const DEPENDENCIES: { name: string; version: string }[] = [
   { name: 'React Native', version: '0.86.3' },
   { name: 'React Navigation', version: '7.3.18' },
   { name: 'React Native Reanimated', version: '4.5.1' },
-  { name: 'Expo Audio', version: '57.0.5' },
+  { name: 'react-native-track-player', version: 'v5' },
   { name: 'NewPipe Extractor', version: 'v0.26.5' },
 ];
 
@@ -76,6 +77,81 @@ const JARVIS_PARAMS: { name: string; value: string }[] = [
   { name: 'Genre affinity', value: 'artists & styles you return to' },
   { name: 'Queue depth', value: 'how long your sessions run' },
 ];
+
+/** Blinking block cursor after the JSON block. */
+const BlinkCursor: React.FC = () => {
+  const opacity = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(opacity, { toValue: 0, duration: 450, useNativeDriver: true }),
+        Animated.timing(opacity, { toValue: 1, duration: 450, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return <Animated.View style={[styles.cursorBlock, { opacity }]} />;
+};
+
+/**
+ * Blinking `$_` shell prompt for the terminal bar's right corner.
+ * NOTE: the animated underscore must NOT be nested inside a static <Text> —
+ * Android renders nested text as spans and span opacity never animates,
+ * which is exactly why the old version looked frozen. Sibling nodes in a
+ * row view animate correctly.
+ */
+const PromptBlink: React.FC = () => {
+  const opacity = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(opacity, { toValue: 0, duration: 500, useNativeDriver: true }),
+        Animated.timing(opacity, { toValue: 1, duration: 500, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return (
+    <View style={styles.termPromptWrap}>
+      <Text style={styles.termPrompt}>$</Text>
+      <Animated.Text style={[styles.termPrompt, { opacity }]}>_</Animated.Text>
+    </View>
+  );
+};
+
+/** Three window dots that pulse one after another, forever. */
+const PulseDots: React.FC = () => {
+  const d0 = useRef(new Animated.Value(0.35)).current;
+  const d1 = useRef(new Animated.Value(0.35)).current;
+  const d2 = useRef(new Animated.Value(0.35)).current;
+  useEffect(() => {
+    // 1320ms cycle per dot; offsets 0 / 440 / 880 keep a clean 1-2-3 wave.
+    const make = (v: Animated.Value, offset: number) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(offset),
+          Animated.timing(v, { toValue: 1, duration: 220, useNativeDriver: true }),
+          Animated.timing(v, { toValue: 0.35, duration: 220, useNativeDriver: true }),
+          Animated.delay(1320 - 440 - offset),
+        ])
+      );
+    const loops = [make(d0, 0), make(d1, 440), make(d2, 880)];
+    loops.forEach((l) => l.start());
+    return () => loops.forEach((l) => l.stop());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return (
+    <View style={styles.termDots}>
+      <Animated.View style={[styles.termDot, { backgroundColor: COLORS.accent.green, opacity: d0 }]} />
+      <Animated.View style={[styles.termDot, { backgroundColor: 'rgba(255,255,255,0.40)', opacity: d1 }]} />
+      <Animated.View style={[styles.termDot, { backgroundColor: 'rgba(255,255,255,0.22)', opacity: d2 }]} />
+    </View>
+  );
+};
 
 export default function ProfileScreen() {
   const insets = useSafeAreaInsets();
@@ -243,7 +319,7 @@ export default function ProfileScreen() {
           <ListRow label="Source code" onPress={() => open(REPO_URL)} showDivider={false} />
         </View>
 
-        {/* ---- development (plain sleek expansion, like every other row) ---- */}
+        {/* ---- development: builder opens as a root-shell terminal card ---- */}
         <Text style={styles.sectionLabel}>DEVELOPMENT</Text>
         <View style={styles.group}>
           <ListRow
@@ -253,17 +329,48 @@ export default function ProfileScreen() {
             showDivider={showBuilder}
           />
           {showBuilder && (
-            <View style={styles.builderBlock}>
-              <View style={styles.builderRow}>
-                <FlowerMark size={32} />
-                <View style={styles.builderInfo}>
-                  <Text style={styles.builderName}>Ayush</Text>
-                  <Text style={styles.builderHandle}>@vivac_ayu</Text>
+            <View style={styles.builderWrap}>
+              <View style={styles.termCard}>
+                <View style={styles.termBar}>
+                  <PulseDots />
+                  <Text style={styles.termTitle} numberOfLines={1}>aurix://root</Text>
+                  <PromptBlink />
                 </View>
+
+                <View style={styles.termBody}>
+                  <Text style={styles.termLine}>
+                    <Text style={styles.tokPrompt}>$ </Text>
+                    <Text style={styles.tokPlain}>cat root.json </Text>
+                    <Text style={styles.tokMuted}>= </Text>
+                    <Text style={styles.tokPlain}>{'{'}</Text>
+                  </Text>
+                  <Text style={styles.termLine}>
+                    <Text style={styles.tokMuted}>{'    '}name: </Text>
+                    <Text style={styles.tokString}>'Ayush'</Text>
+                    <Text style={styles.tokMuted}>,</Text>
+                  </Text>
+                  <Text style={styles.termLine}>
+                    <Text style={styles.tokMuted}>{'    '}instagram: </Text>
+                    <Text style={styles.tokString}>'@vivac_ayu'</Text>
+                    <Text style={styles.tokMuted}>,</Text>
+                  </Text>
+                  <Text style={styles.termLine}>
+                    <Text style={styles.tokMuted}>{'    '}single: </Text>
+                    <Text style={styles.tokString}>'true'</Text>
+                  </Text>
+                  <View style={styles.termLastLine}>
+                    <Text style={styles.termLine}>
+                      <Text style={styles.tokPlain}>{'}'}</Text>
+                    </Text>
+                    <BlinkCursor />
+                  </View>
+                </View>
+
+                <TouchableOpacity style={styles.followPill} activeOpacity={0.85} onPress={() => open(IG_URL)}>
+                  <Text style={styles.followPillText}>Tap to Follow</Text>
+                  <ArrowUpRight color={COLORS.background} size={16} />
+                </TouchableOpacity>
               </View>
-              <TouchableOpacity style={styles.followPill} activeOpacity={0.8} onPress={() => open(IG_URL)}>
-                <Text style={styles.followPillText}>Tap to Follow</Text>
-              </TouchableOpacity>
             </View>
           )}
         </View>
@@ -304,7 +411,7 @@ export default function ProfileScreen() {
             <View style={styles.infoBlock}>
               <View style={styles.infoLine}>
                 <Text style={styles.infoKey}>Audio engine</Text>
-                <Text style={styles.infoValue}>expo-audio</Text>
+                <Text style={styles.infoValue}>RNTP v5</Text>
               </View>
               <View style={styles.infoLine}>
                 <Text style={styles.infoKey}>Stream extraction</Text>
@@ -505,36 +612,73 @@ const styles = StyleSheet.create({
   aboutLabel: { fontFamily: FONTS.regular, fontSize: 15, color: COLORS.text.secondary },
   aboutValue: { fontFamily: FONTS.medium, fontSize: 15, color: COLORS.text.primary },
 
-  /* Builder expansion — plain and sleek, same language as every other row. */
-  builderBlock: {
+  /* ---- root-shell terminal card ---- */
+  builderWrap: {
     paddingHorizontal: SIZES.md,
-    paddingTop: SIZES.xs,
+    paddingTop: SIZES.smd,
     paddingBottom: SIZES.md,
   },
-  builderRow: {
+  termCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: SIZES.radius.lg,
+    borderWidth: 1,
+    borderColor: COLORS.hairline,
+    paddingHorizontal: SIZES.md,
+    paddingTop: SIZES.md,
+    paddingBottom: SIZES.md,
+  },
+  termBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: SIZES.smd,
+    gap: SIZES.sm,
+    paddingBottom: SIZES.sm,
     marginBottom: SIZES.md,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLORS.hairline,
   },
-  builderInfo: { flex: 1 },
-  builderName: { fontFamily: FONTS.bold, fontSize: 17, color: COLORS.text.primary },
-  builderHandle: {
-    fontFamily: FONTS.regular,
+  termDots: { flexDirection: 'row', gap: 5 },
+  termDot: { width: 8, height: 8, borderRadius: 4 },
+  termTitle: {
+    flex: 1,
+    fontFamily: 'monospace',
+    fontSize: 11,
+    color: COLORS.text.muted,
+    letterSpacing: 0.5,
+  },
+  termPromptWrap: { flexDirection: 'row', alignItems: 'center' },
+  termPrompt: {
+    fontFamily: 'monospace',
     fontSize: 13,
-    color: COLORS.text.secondary,
-    marginTop: 2,
+    color: COLORS.accent.green,
   },
+  termBody: { marginBottom: SIZES.md },
+  termLine: {
+    fontFamily: 'monospace',
+    fontSize: 13.5,
+    lineHeight: 22,
+  },
+  termLastLine: { flexDirection: 'row', alignItems: 'center' },
+  cursorBlock: {
+    width: 8,
+    height: 15,
+    backgroundColor: COLORS.accent.green,
+    marginLeft: 6,
+    borderRadius: 1.5,
+  },
+  tokPrompt: { color: COLORS.accent.green },
+  tokPlain: { color: COLORS.text.primary },
+  tokMuted: { color: COLORS.text.muted },
+  tokString: { color: '#FF9DB1' },
   followPill: {
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: SIZES.sm,
     borderRadius: SIZES.radius.pill,
-    backgroundColor: COLORS.surfaceRaised,
-    borderWidth: 1,
-    borderColor: COLORS.accent.green,
+    backgroundColor: COLORS.accent.green,
     paddingVertical: SIZES.sm + 2,
   },
-  followPillText: { fontFamily: FONTS.semibold, fontSize: 14, color: COLORS.text.primary },
+  followPillText: { fontFamily: FONTS.semibold, fontSize: 14, color: COLORS.background },
 
   infoBlock: {
     paddingHorizontal: SIZES.md,
