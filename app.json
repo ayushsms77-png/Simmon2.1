@@ -52,6 +52,11 @@
       "./plugins/withAndroidAbis",
       "./plugins/withReleaseSigning"
     ],
-    "backgroundColor": "#000000"
+    "backgroundColor": "#000000",
+    "extra": {
+      "eas": {
+        "projectId": "65a8b803-c802-43fc-b6a0-b2ea958ae534"
+      }
+    }
   }
 }
