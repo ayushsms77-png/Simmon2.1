@@ -147,6 +147,46 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
 
   // ---- loading a track --------------------------------------------------
 
+  /**
+   * Bookkeeping for "this track is now genuinely the one playing" — called
+   * both after a fresh load() succeeds AND when RNTP's own queue moves on by
+   * itself (see the onActiveTrackChanged listener below). Does NOT touch
+   * playback itself; in the second case audio is already correctly playing,
+   * this only catches the app's own state up to match reality.
+   */
+  const onTrackNowPlaying = useCallback((track: Track) => {
+    setCurrentTrack(track);
+    setIsLoading(false);
+    setError(null);
+    autoSkips.current = 0;
+    loadingTrackId.current = null;
+    // A track genuinely different from whatever history was last written
+    // for gets a fresh listen-tracking window; a same-track re-arrival
+    // (e.g. repeat-one) must not reopen it and log a duplicate.
+    if (historyWrittenFor.current !== track.id) historyWrittenFor.current = null;
+    LibraryService.recordPlay(track);
+
+    // Warm exactly one track ahead, so pressing skip is instant, and put it
+    // into RNTP's own real queue once resolved so the lock-screen Next
+    // button renders enabled and Previous stops just restarting the current
+    // track (see PlaybackEngine.queueNext). This reuses MusicService's own
+    // de-duped/cached resolve — no duplicate network fetch.
+    const upcoming = queueRef.current.peekNext();
+    preloader.schedule(upcoming);
+    if (upcoming) {
+      MusicService.resolveStream(upcoming)
+        .then((nextStream) => {
+          // Only apply if the queue has not moved on in the meantime.
+          if (queueRef.current.peekNext()?.id === upcoming.id) {
+            playbackEngine.queueNext(upcoming, nextStream);
+          }
+        })
+        .catch(() => {
+          // Best-effort — the OS button simply stays as it was.
+        });
+    }
+  }, []);
+
   const loadCurrent = useCallback(
     async (options: { autoPlay?: boolean; startPosition?: number } = {}) => {
       const track = queueRef.current.current;
@@ -192,32 +232,8 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         await playbackEngine.load(track, stream, options);
         if (id !== loadId.current) return;
 
-        setIsLoading(false);
-        autoSkips.current = 0;
-        loadingTrackId.current = null;
         if (__DEV__) console.log('[playback] started', track.title);
-        LibraryService.recordPlay(track);
-        // Warm exactly one track ahead, so pressing skip is instant.
-        const upcoming = queueRef.current.peekNext();
-        preloader.schedule(upcoming);
-        // Also put it into RNTP's own real queue once resolved, so the
-        // lock-screen Next button renders enabled and Previous stops just
-        // restarting the current track (see PlaybackEngine.queueNext). This
-        // reuses MusicService's own de-duped/cached resolve — the preload
-        // line above and this one do not cause two separate network fetches.
-        if (upcoming) {
-          MusicService.resolveStream(upcoming)
-            .then((nextStream) => {
-              // Only apply if this load() is still the current one and the
-              // queue has not moved on in the meantime.
-              if (id === loadId.current && queueRef.current.peekNext()?.id === upcoming.id) {
-                playbackEngine.queueNext(upcoming, nextStream);
-              }
-            })
-            .catch(() => {
-              // Best-effort — the OS button simply stays as it was.
-            });
-        }
+        onTrackNowPlaying(track);
       } catch (e) {
         if (id !== loadId.current) return;
         // Always leave the loading state, whatever went wrong.
@@ -253,7 +269,7 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         setError(messageFor(err));
       }
     },
-    [bumpQueue, persistQueue]
+    [bumpQueue, onTrackNowPlaying, persistQueue]
   );
 
   // ---- engine wiring ----------------------------------------------------
@@ -285,6 +301,37 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     // reach here via react-native-track-player — see PlaybackEngine.ts.
     playbackEngine.on('onRemoteNext', () => next());
     playbackEngine.on('onRemotePrevious', () => previous());
+    // PATCH: the real fix for "notification/audio show the new song but the
+    // app still shows the old one." Once queueNext() has put a real track
+    // after the current one, RNTP can move on to it by itself — this is how
+    // the app finds out and catches its own state up, WITHOUT calling
+    // playbackEngine.load() again (audio is already correctly playing).
+    playbackEngine.on('onActiveTrackChanged', (mediaId) => {
+      // The track that just stopped being active — same skip-vs-complete
+      // distinction next()/previous() already use elsewhere.
+      const leavingTrack = queueRef.current.current;
+      if (leavingTrack) {
+        if (historyWrittenFor.current === leavingTrack.id) {
+          TasteService.recordComplete(leavingTrack);
+        } else {
+          TasteService.recordSkip(leavingTrack);
+        }
+      }
+
+      // We only ever put queueRef's own peekNext() into RNTP, so that is
+      // what this almost always is; jumpTo is a defensive fallback for the
+      // rare case the JS queue changed shape after that track was queued
+      // (e.g. a manual reorder) — it re-aligns to whatever is truly playing
+      // instead of leaving the app showing something false.
+      const landed =
+        queueRef.current.peekNext()?.id === mediaId
+          ? queueRef.current.next(true)
+          : queueRef.current.jumpTo(mediaId);
+
+      bumpQueue();
+      persistQueue();
+      if (landed) onTrackNowPlaying(landed);
+    });
     return () => {
       preloader.cancel();
       void playbackEngine.release();
