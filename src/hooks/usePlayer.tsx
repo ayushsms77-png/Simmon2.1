@@ -262,6 +262,10 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       setIsLoading(false);
       setError(messageFor(e instanceof AppError ? e : toAppError(e, 'playback_failed')));
     });
+    // Lock screen / notification / Bluetooth skip-next and skip-previous
+    // reach here via react-native-track-player — see PlaybackEngine.ts.
+    playbackEngine.on('onRemoteNext', () => next());
+    playbackEngine.on('onRemotePrevious', () => previous());
     return () => {
       preloader.cancel();
       void playbackEngine.release();
@@ -338,6 +342,20 @@ export const PlayerProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- ask for notification permission (Android 13+) --------------------
+  // Without this, the lock-screen/notification media widget (artwork,
+  // play/pause, next/prev, progress bar) never renders for the user at all —
+  // playback still works, but silently with no controls visible. This was
+  // previously written but left commented out inside the now-disabled
+  // react-native-playback-controls block below; pulled out on its own here
+  // since it has nothing to do with that library or its crash.
+  useEffect(() => {
+    if (Platform.OS !== 'android' || Platform.Version < 33) return;
+    PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
+    ).catch(() => undefined);
   }, []);
 
   // ---- persist playback position ---------------------------------------
