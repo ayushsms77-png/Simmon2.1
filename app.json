@@ -38,13 +38,6 @@
     },
     "plugins": [
       "expo-font",
-      [
-        "expo-audio",
-        {
-          "enableBackgroundPlayback": true,
-          "recordAudioAndroid": false
-        }
-      ],
       "expo-asset",
       [
         "expo-splash-screen",
