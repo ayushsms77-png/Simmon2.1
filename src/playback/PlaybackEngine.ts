@@ -1,10 +1,9 @@
 import { Platform } from 'react-native';
-import {
-  AudioPlayer,
-  createAudioPlayer,
-  setAudioModeAsync,
-  setIsAudioActiveAsync,
-} from 'expo-audio';
+import TrackPlayer, {
+  Event,
+  PlaybackState,
+  PlayerCommand,
+} from '@rntp/player';
 import { appError, toAppError } from '../core/errors';
 import { ResolvedStream, Track } from '../core/types';
 
@@ -34,37 +33,49 @@ type EngineEvents = {
   onComplete: () => void;
   /** Playback failed for the loaded track. */
   onError: (error: unknown) => void;
+  /**
+   * The OS-level skip-next / skip-previous control was pressed (lock
+   * screen, notification, Bluetooth/AVRCP, Android Auto). Configured below
+   * (see setCommands) with handling: 'hybrid' and Next/Previous specifically
+   * routed to JS — everything else (play/pause/seek) stays on RNTP's
+   * reliable default native handling. This is a deliberate choice: our
+   * queue still lives outside RNTP (one track loaded at a time, same as
+   * before), so "next" has to mean "ask the app to load a different
+   * track," not "advance RNTP's own queue" — native handling alone
+   * couldn't do that.
+   */
+  onRemoteNext: () => void;
+  onRemotePrevious: () => void;
 };
 
 /**
- * Wraps expo-audio behind a small imperative interface.
+ * Wraps react-native-track-player v5 (@rntp/player) behind the SAME small
+ * imperative interface PlaybackEngine has always exposed to the rest of the
+ * app — usePlayer.tsx does not need to change for this migration.
  *
- * The engine is intentionally ignorant of queues, providers and the UI: it
- * plays one resolved stream at a time and reports what happened. Everything
- * about *which* track plays next lives in the controller above it.
+ * Still loads ONE track at a time via load(), same as before — this
+ * migration does not turn the app into a real multi-track native queue.
+ * What v5 fixes on its own, with no further work: the progress bar and
+ * play/pause/seek all rendering correctly, because RNTP owns a real,
+ * standard notification instead of expo-audio's hand-rolled one. Real
+ * native next/prev (skipping within an actual queued set of tracks) is a
+ * separate, later step if you ever want it.
  */
 export class PlaybackEngine {
-  private player: AudioPlayer | null = null;
-  private subscription: { remove: () => void } | null = null;
   private listeners: Partial<EngineEvents> = {};
 
   private status: PlaybackStatus = { ...IDLE_STATUS };
   private currentTrackId: string | null = null;
   private desiredVolume = 1;
 
-  /** Guards against a stalled load leaving the UI spinning forever. */
   private loadTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Set while we are swapping sources, so stale status events are ignored. */
   private loadToken = 0;
   private completionFired = false;
 
   private configured = false;
-  /** Whether the media session/notification is currently attached. */
-  private lockScreenActive = false;
-  /** Track the notification is currently showing. */
-  private lockScreenTrack: Track | null = null;
-  /** Whether metadata has been re-asserted since playback actually began. */
-  private lockScreenSynced = false;
+
+  private progressTimer: ReturnType<typeof setInterval> | null = null;
+  private eventSubs: { remove: () => void }[] = [];
 
   on<K extends keyof EngineEvents>(event: K, handler: EngineEvents[K]): void {
     this.listeners[event] = handler;
@@ -74,81 +85,122 @@ export class PlaybackEngine {
     return this.status;
   }
 
-  /**
-   * Configure the global audio session: keep playing when the device is
-   * silenced or the app is backgrounded.
-   */
-  async configure(): Promise<void> {
+  /** Set up the player once. Safe to call repeatedly. Fully synchronous. */
+  configure(): void {
     if (this.configured) return;
-    this.configured = true;
 
-    try {
-      await setAudioModeAsync({
-        playsInSilentMode: true,
-        shouldPlayInBackground: true,
-        interruptionMode: 'doNotMix',
-      });
-
-      // release() deactivates the audio session, and setting the mode does not
-      // bring it back. Re-activating explicitly is what lets the engine play
-      // again after a teardown.
-      await setIsAudioActiveAsync(true);
-    } catch {
-      // Audio mode is a best-effort optimisation, never a reason to fail.
-    }
-  }
-
-  private ensurePlayer(): AudioPlayer {
-    if (this.player) return this.player;
-
-    // 250ms keeps the progress bar smooth without flooding React with updates.
-    const player = createAudioPlayer(null, { updateInterval: 250 });
-    player.volume = this.desiredVolume;
-
-    this.subscription = player.addListener('playbackStatusUpdate', (s) => {
-      this.handleStatus(s);
+    TrackPlayer.setupPlayer({
+      contentType: 'music',
+      handleAudioBecomingNoisy: true,
     });
 
-    this.player = player;
-    return player;
+    // handling: 'hybrid' keeps Play/Pause/Seek on RNTP's reliable native
+    // path (works with Android Auto, Bluetooth, etc. with zero JS), while
+    // routing Next/Previous to our own onRemoteNext/onRemotePrevious —
+    // required because our queue is still external to RNTP (see class doc).
+    TrackPlayer.setCommands({
+      capabilities: [
+        PlayerCommand.PlayPause,
+        PlayerCommand.Next,
+        PlayerCommand.Previous,
+        PlayerCommand.Seek,
+      ],
+      handling: 'hybrid',
+      perCommandHandling: {
+        [PlayerCommand.Next]: 'js',
+        [PlayerCommand.Previous]: 'js',
+      },
+    });
+
+    this.attachEventListeners();
+    this.startProgressPolling();
+    this.configured = true;
   }
 
-  private handleStatus(s: any): void {
-    const duration = Number.isFinite(s?.duration) && s.duration > 0 ? s.duration : 0;
-    const position = Number.isFinite(s?.currentTime) ? Math.max(0, s.currentTime) : 0;
+  private attachEventListeners(): void {
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.PlaybackStateChanged, ({ state }) => {
+        this.handlePlaybackStateChanged(state);
+      })
+    );
 
-    // A source that has started reporting time is no longer "loading".
-    if (s?.isLoaded && this.loadTimer) {
-      clearTimeout(this.loadTimer);
-      this.loadTimer = null;
-    }
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.IsPlayingChanged, ({ playing }) => {
+        this.status = { ...this.status, isPlaying: playing };
+        this.listeners.onStatus?.(this.status);
+      })
+    );
 
-    if (s?.error) {
-      this.clearLoadTimer();
-      this.listeners.onError?.(appError('playback_failed', String(s.error)));
-      return;
-    }
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.PlaybackError, ({ message }) => {
+        this.clearLoadTimer();
+        this.listeners.onError?.(appError('playback_failed', message));
+      })
+    );
+
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.MediaItemTransition, ({ item }) => {
+        // Fires when the active queue item changes to null — since we only
+        // ever load one item at a time, that means it finished with nothing
+        // queued after it.
+        if (!item && !this.completionFired) {
+          this.completionFired = true;
+          this.listeners.onComplete?.();
+        }
+      })
+    );
+
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.RemoteNext, () => {
+        this.listeners.onRemoteNext?.();
+      })
+    );
+
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.RemotePrevious, () => {
+        this.listeners.onRemotePrevious?.();
+      })
+    );
+  }
+
+  /** No per-tick position event in this API — poll on the old 250ms cadence. */
+  private startProgressPolling(): void {
+    if (this.progressTimer) return;
+    this.progressTimer = setInterval(() => {
+      try {
+        const progress = TrackPlayer.getProgress();
+        const duration = Number.isFinite(progress.duration) && progress.duration > 0
+          ? progress.duration
+          : 0;
+        const position = Number.isFinite(progress.position)
+          ? Math.max(0, progress.position)
+          : 0;
+
+        if (duration > 0 && this.loadTimer) {
+          this.clearLoadTimer();
+        }
+
+        this.status = { ...this.status, position, duration };
+        this.listeners.onStatus?.(this.status);
+      } catch {
+        /* transient — the queue may be momentarily empty */
+      }
+    }, 250);
+  }
+
+  private handlePlaybackStateChanged(state: PlaybackState): void {
+    // PlaybackState here is Idle | Ready | Buffering | Ended | Error —
+    // "is it playing" is tracked separately via IsPlayingChanged above.
+    const isBuffering = state === PlaybackState.Buffering;
+    const isLoaded = state === PlaybackState.Ready || state === PlaybackState.Buffering;
 
     this.status = {
-      isPlaying: Boolean(s?.playing),
-      isBuffering: Boolean(s?.isBuffering),
-      isLoaded: Boolean(s?.isLoaded),
-      position,
-      duration,
-      volume: Number.isFinite(s?.volume) ? s.volume : this.desiredVolume,
+      ...this.status,
+      isBuffering,
+      isLoaded,
+      volume: this.desiredVolume,
     };
-
     this.listeners.onStatus?.(this.status);
-
-    // Once the source is genuinely playing, the service is bound and the
-    // notification will accept metadata.
-    if (s?.isLoaded && s?.playing) this.syncLockScreenOnce();
-
-    // `didJustFinish` can repeat across updates; fire completion only once.
-    if (s?.didJustFinish && !this.completionFired) {
-      this.completionFired = true;
-      this.listeners.onComplete?.();
-    }
   }
 
   private clearLoadTimer(): void {
@@ -168,8 +220,7 @@ export class PlaybackEngine {
     const token = ++this.loadToken;
 
     try {
-      const player = this.ensurePlayer();
-      await this.configure();
+      this.configure();
 
       this.currentTrackId = track.id;
       this.completionFired = false;
@@ -177,10 +228,22 @@ export class PlaybackEngine {
       this.status = { ...IDLE_STATUS, isBuffering: true, volume: this.desiredVolume };
       this.listeners.onStatus?.(this.status);
 
-      // Headers matter: a googlevideo URL fetched with a different User-Agent
-      // than the one that extracted it comes back 403.
-      player.replace({ uri: stream.url, headers: stream.headers });
-      player.volume = this.desiredVolume;
+      // setMediaItems() replaces the whole queue with this one track,
+      // matching the old engine's "one track at a time" contract exactly.
+      // headers live nested under `url`, not as a sibling field — confirmed
+      // against the real MediaItem type, not the library's own docs (which
+      // didn't show this at all).
+      TrackPlayer.setMediaItems([
+        {
+          mediaId: track.id,
+          url: { uri: stream.url, headers: stream.headers },
+          title: track.title,
+          artist: track.artist.name,
+          albumTitle: track.album,
+          artworkUrl: track.albumImageUrl || undefined,
+        },
+      ]);
+      TrackPlayer.setVolume(this.desiredVolume);
 
       // If the source never loads, surface a real error instead of hanging.
       this.clearLoadTimer();
@@ -192,15 +255,15 @@ export class PlaybackEngine {
 
       if (startPosition > 0) {
         try {
-          await player.seekTo(startPosition);
+          TrackPlayer.seekTo(startPosition);
         } catch {
           // Seeking before the source is ready is not fatal.
         }
       }
 
-      if (autoPlay) player.play();
-
-      this.setLockScreenMetadata(track);
+      if (autoPlay) {
+        TrackPlayer.play();
+      }
     } catch (e) {
       this.clearLoadTimer();
       throw toAppError(e, 'playback_failed');
@@ -209,7 +272,7 @@ export class PlaybackEngine {
 
   play(): void {
     try {
-      this.player?.play();
+      TrackPlayer.play();
     } catch (e) {
       this.listeners.onError?.(toAppError(e, 'playback_failed'));
     }
@@ -217,28 +280,22 @@ export class PlaybackEngine {
 
   pause(): void {
     try {
-      this.player?.pause();
+      TrackPlayer.pause();
     } catch {
       /* pausing a released player is harmless */
     }
   }
 
   async seekTo(seconds: number): Promise<void> {
-    if (!this.player) return;
-
-    // A non-finite target would poison the media element's currentTime and
-    // put the player into a permanent error state.
     if (!Number.isFinite(seconds)) return;
 
     const duration = this.status.duration;
     const target = Math.max(0, duration > 0 ? Math.min(seconds, duration) : seconds);
 
     try {
-      // Seeking backwards after a finish should allow completion to fire again.
       this.completionFired = false;
-      await this.player.seekTo(target);
+      TrackPlayer.seekTo(target);
 
-      // Reflect the new position immediately so the UI does not lag a tick.
       this.status = { ...this.status, position: target };
       this.listeners.onStatus?.(this.status);
     } catch (e) {
@@ -248,7 +305,13 @@ export class PlaybackEngine {
 
   setVolume(volume: number): void {
     this.desiredVolume = Math.max(0, Math.min(1, volume));
-    if (this.player) this.player.volume = this.desiredVolume;
+    if (this.configured) {
+      try {
+        TrackPlayer.setVolume(this.desiredVolume);
+      } catch {
+        /* best effort */
+      }
+    }
 
     this.status = { ...this.status, volume: this.desiredVolume };
     this.listeners.onStatus?.(this.status);
@@ -266,111 +329,13 @@ export class PlaybackEngine {
     this.completionFired = false;
 
     try {
-      this.player?.pause();
-      this.player?.replace(null);
+      TrackPlayer.stop();
     } catch {
       /* already torn down */
     }
 
-    this.clearLockScreen();
-
     this.status = { ...IDLE_STATUS, volume: this.desiredVolume };
     this.listeners.onStatus?.(this.status);
-  }
-
-  /**
-   * Native lock-screen / notification controls.
-   *
-   * expo-audio owns the single MediaSession; NØTE must not create a second
-   * one. Play/pause, the scrub bar and seek +/-10s act directly on this same
-   * player, so the engine stays the one source of truth.
-   *
-   * Attaching and updating are deliberately different calls:
-   *
-   *   setActiveForLockScreen  rebuilds the MediaSession from scratch
-   *                           (AudioControlsService.setPlayerOptions releases
-   *                           the session and builds a new one)
-   *   updateLockScreenMetadata swaps the metadata on the live session
-   *
-   * So attach runs once. Calling it per track looked like it fixed stale
-   * titles, but it rebuilt the session at the instant each track started --
-   * when position and duration are still 0 -- leaving the notification stuck
-   * at 00:00 with a dead progress bar.
-   *
-   * Next/previous are absent because expo-audio’s AudioMediaSessionCallback
-   * removes COMMAND_SEEK_TO_NEXT / COMMAND_SEEK_TO_PREVIOUS from the session
-   * and exposes no JS event for them.
-   */
-  private setLockScreenMetadata(track: Track): void {
-    if (Platform.OS === 'web') return;
-
-    this.lockScreenTrack = track;
-    this.lockScreenSynced = false;
-
-    const metadata = this.metadataFor(track);
-
-    try {
-      if (this.lockScreenActive) {
-        // Live session: swap metadata in place, keeping position/duration.
-        this.player?.updateLockScreenMetadata(metadata);
-        return;
-      }
-
-      this.player?.setActiveForLockScreen(true, metadata, {
-        showSeekForward: true,
-        showSeekBackward: true,
-      });
-      this.lockScreenActive = true;
-    } catch {
-      // Lock screen controls are optional; never block playback on them.
-    }
-  }
-
-  private metadataFor(track: Track) {
-    return {
-      title: track.title,
-      artist: track.artist.name,
-      albumTitle: track.album,
-      artworkUrl: track.albumImageUrl || undefined,
-    };
-  }
-
-  /**
-   * Re-assert metadata once the source is actually playing.
-   *
-   * updateLockScreenMetadata only applies while the playback service is
-   * BOUND; during BINDING it logs a warning and discards the metadata. That
-   * window is what previously left the notification showing an older track.
-   * Re-sending once playback has genuinely started closes it, and is driven
-   * by a real event rather than a guessed delay. It is a metadata swap, not
-   * a session rebuild, so the progress bar keeps running.
-   */
-  private syncLockScreenOnce(): void {
-    if (Platform.OS === 'web') return;
-    if (this.lockScreenSynced || !this.lockScreenActive) return;
-
-    const track = this.lockScreenTrack;
-    if (!track) return;
-
-    this.lockScreenSynced = true;
-    try {
-      this.player?.updateLockScreenMetadata(this.metadataFor(track));
-    } catch {
-      /* best effort */
-    }
-  }
-  /** Tear down the notification/session when playback is genuinely over. */
-  private clearLockScreen(): void {
-    if (Platform.OS === 'web' || !this.lockScreenActive) return;
-
-    try {
-      this.player?.clearLockScreenControls();
-    } catch {
-      /* best effort */
-    }
-    this.lockScreenActive = false;
-    this.lockScreenTrack = null;
-    this.lockScreenSynced = false;
   }
 
   get trackId(): string | null {
@@ -378,27 +343,24 @@ export class PlaybackEngine {
   }
 
   async release(): Promise<void> {
+    if (Platform.OS === 'web') return;
+
     this.clearLoadTimer();
-    this.clearLockScreen();
 
-    // The audio session is about to be deactivated, so the next player must
-    // reconfigure it. Without this the engine silently never plays again: a
-    // new player is created and reports "started", but the session it needs is
-    // still inactive, so playback sits at 0. Fast Refresh unmounts and
-    // remounts the provider in development, which hits this on every edit.
-    this.configured = false;
-    this.subscription?.remove();
-    this.subscription = null;
-
-    try {
-      this.player?.remove();
-    } catch {
-      /* best effort */
+    if (this.progressTimer) {
+      clearInterval(this.progressTimer);
+      this.progressTimer = null;
     }
-    this.player = null;
+
+    for (const sub of this.eventSubs) {
+      sub.remove();
+    }
+    this.eventSubs = [];
+
+    this.configured = false;
 
     try {
-      await setIsAudioActiveAsync(false);
+      TrackPlayer.stop();
     } catch {
       /* best effort */
     }
