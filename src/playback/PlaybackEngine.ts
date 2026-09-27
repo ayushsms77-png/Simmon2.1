@@ -37,29 +37,41 @@ type EngineEvents = {
    * The OS-level skip-next / skip-previous control was pressed (lock
    * screen, notification, Bluetooth/AVRCP, Android Auto). Configured below
    * (see setCommands) with handling: 'hybrid' and Next/Previous specifically
-   * routed to JS — everything else (play/pause/seek) stays on RNTP's
-   * reliable default native handling. This is a deliberate choice: our
-   * queue still lives outside RNTP (one track loaded at a time, same as
-   * before), so "next" has to mean "ask the app to load a different
-   * track," not "advance RNTP's own queue" — native handling alone
-   * couldn't do that.
+   * routed to JS. IMPORTANT, corrected after real-device testing: this does
+   * NOT reliably mean "RNTP will wait for the app to decide what happens
+   * next." Once queueNext() has put a real second item in RNTP's own
+   * queue, RNTP can and does advance to it on its own — audio and
+   * notification metadata update correctly immediately, but nothing tells
+   * the app's JS state that happened unless something is listening for it.
+   * That "something" is onActiveTrackChanged below, not this callback —
+   * this one still exists for the case where nothing is queued yet and the
+   * app must resolve a track from scratch.
    */
   onRemoteNext: () => void;
   onRemotePrevious: () => void;
+  /**
+   * RNTP's own active queue item changed to a genuinely different track,
+   * for ANY reason: it auto-continued into a track queueNext() had already
+   * placed after the current one, a remote button press it decided to
+   * handle itself, or anything else outside the app's own load() call.
+   * This is the real fix for the "notification shows the new song, but the
+   * app's title/artist stay on the old one" bug — the app must treat RNTP's
+   * own queue as ground truth for *which track is actually playing*, not
+   * assume it only changes when the app itself calls load().
+   */
+  onActiveTrackChanged: (mediaId: string) => void;
 };
 
 /**
  * Wraps react-native-track-player v5 (@rntp/player) behind the SAME small
  * imperative interface PlaybackEngine has always exposed to the rest of the
- * app — usePlayer.tsx does not need to change for this migration.
- *
- * Still loads ONE track at a time via load(), same as before — this
- * migration does not turn the app into a real multi-track native queue.
- * What v5 fixes on its own, with no further work: the progress bar and
- * play/pause/seek all rendering correctly, because RNTP owns a real,
- * standard notification instead of expo-audio's hand-rolled one. Real
- * native next/prev (skipping within an actual queued set of tracks) is a
- * separate, later step if you ever want it.
+ * app — usePlayer.tsx does not need to change ITS PUBLIC API for this
+ * migration, but it DOES need to listen for onActiveTrackChanged now (see
+ * that event's doc) instead of assuming only load() ever changes what's
+ * playing. queueNext() puts a real second item in RNTP's queue so the
+ * lock-screen Next button works and shows correctly — but a real queue
+ * means RNTP can genuinely move through it on its own, and the app has to
+ * follow along rather than assume it is always the one deciding.
  */
 export class PlaybackEngine {
   private listeners: Partial<EngineEvents> = {};
@@ -149,6 +161,32 @@ export class PlaybackEngine {
         this.listeners.onRemotePrevious?.();
       })
     );
+
+    // PATCH: this is the real fix for "notification shows the new song but
+    // the app still shows the old one." MediaItemTransition fires whenever
+    // RNTP's actual active item changes, for ANY reason — including on its
+    // own, once queueNext() has put a real track after the current one.
+    // load() already sets currentTrackId BEFORE calling setMediaItems(), so
+    // a transition caused by our OWN load() reports a mediaId that already
+    // matches — no double-handling. Only a transition RNTP made on its own
+    // reports something different, which is exactly the case the app needs
+    // to be told about.
+    this.eventSubs.push(
+      TrackPlayer.addEventListener(Event.MediaItemTransition, ({ item }) => {
+        if (item?.mediaId && item.mediaId !== this.currentTrackId) {
+          this.currentTrackId = item.mediaId;
+          this.completionFired = false;
+          this.listeners.onActiveTrackChanged?.(item.mediaId);
+          return;
+        }
+
+        if (!item && !this.completionFired) {
+          // The queue genuinely has nothing left after whatever just ended.
+          this.completionFired = true;
+          this.listeners.onComplete?.();
+        }
+      })
+    );
   }
 
   /** No per-tick position event in this API — poll on the old 250ms cadence. */
@@ -177,15 +215,27 @@ export class PlaybackEngine {
   }
 
   private handlePlaybackStateChanged(state: PlaybackState): void {
-    // PATCH: the correct "track finished" signal for a single-item queue is
-    // PlaybackState.Ended — the previous version watched for
-    // MediaItemTransition firing with a null item instead, which only
-    // happens when a NEXT queued item is removed/skipped past, not when a
-    // lone track simply plays to the end. That's why playback was stopping
-    // silently instead of advancing: onComplete was never being called.
+    // PATCH: Ended fires every time ANY track finishes — including one that
+    // correctly continues into a queueNext()'d track a moment later. Firing
+    // onComplete here unconditionally (as an earlier version of this file
+    // did) would wrongly treat a normal, correct continuation as "nothing
+    // left to play." The real completion signal is now
+    // MediaItemTransition reporting item === null (see attachEventListeners)
+    // — this is kept only as a defensive fallback, in case some real-device
+    // scenario ends without ever firing that transition, guarded by the
+    // same completionFired flag so the two can never double-fire.
     if (state === PlaybackState.Ended && !this.completionFired) {
-      this.completionFired = true;
-      this.listeners.onComplete?.();
+      try {
+        const activeIndex = TrackPlayer.getActiveMediaItemIndex();
+        const queueLength = TrackPlayer.getQueue().length;
+        const nothingAfterThis = activeIndex === null || activeIndex >= queueLength - 1;
+        if (nothingAfterThis) {
+          this.completionFired = true;
+          this.listeners.onComplete?.();
+        }
+      } catch {
+        /* if this can't be checked, MediaItemTransition remains the source of truth */
+      }
     }
 
     // PlaybackState here is Idle | Ready | Buffering | Ended | Error —
@@ -234,13 +284,14 @@ export class PlaybackEngine {
    * load() only ever puts ONE item in that queue, RNTP correctly reported
    * "no next" — this appends the second, real one.
    *
-   * The actual *decision* of what to advance to, TasteService recording,
-   * related-track extension when the queue is nearly empty, etc. all still
-   * live in usePlayer.tsx exactly as before — pressing Next still calls the
-   * app's own next(), same as always (see the onRemoteNext wiring above).
-   * This method exists purely so the button shows up correctly and Previous
-   * stops just restarting the current track; it does not change who decides
-   * what plays.
+   * The *decision* of what track comes next — TasteService recording,
+   * related-track extension when the queue is nearly empty, etc. — still
+   * lives in usePlayer.tsx exactly as before; this method only ever queues
+   * the SAME track that decision already picked (queueRef.peekNext()).
+   * IMPORTANT, corrected after real-device testing: once this real item
+   * exists, pressing Next (or a natural end-of-track) may be handled by
+   * RNTP itself rather than always calling the app's onRemoteNext — see
+   * onActiveTrackChanged, which is how the app now finds out either way.
    */
   queueNext(track: Track, stream: ResolvedStream): void {
     if (!this.configured) return;
