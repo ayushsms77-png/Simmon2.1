@@ -10,15 +10,21 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Check, Heart, ListMusic, Plus, X } from 'lucide-react-native';
+import { Check, Download, Heart, ListMusic, Plus, Trash2, X } from 'lucide-react-native';
 import { COLORS, SIZES, FONTS } from '../../constants/theme';
 import { Track } from '../../core/types';
 import { useLibrary } from '../../hooks/useLibrary';
+import { DownloadService } from '../../services/DownloadService';
 
 type Props = {
   /** The track being filed. Null closes the sheet. */
   track: Track | null;
   onClose: () => void;
+  /**
+   * When given (Downloaded Music screen), the sheet shows a red "Delete
+   * download" row instead of a Download row.
+   */
+  onDelete?: (track: Track) => void;
 };
 
 /**
@@ -28,7 +34,7 @@ type Props = {
  * from track rows on several screens, and a route would force each of them to
  * know about it.
  */
-export const AddToPlaylistSheet: React.FC<Props> = ({ track, onClose }) => {
+export const AddToPlaylistSheet: React.FC<Props> = ({ track, onClose, onDelete }) => {
   const insets = useSafeAreaInsets();
   const {
     playlists,
@@ -62,6 +68,35 @@ export const AddToPlaylistSheet: React.FC<Props> = ({ track, onClose }) => {
   }, []);
 
   const liked = track ? isLiked(track.id) : false;
+
+  // Live download state for the track this sheet is open for.
+  const [downloaded, setDownloaded] = useState(false);
+  const [dlProgress, setDlProgress] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    if (!track) return;
+    const sync = () => {
+      setDownloaded(DownloadService.isDownloaded(track.id));
+      setDlProgress(DownloadService.getProgress(track.id));
+    };
+    sync();
+    return DownloadService.subscribe(sync);
+  }, [track]);
+
+  const handleDownload = useCallback(() => {
+    if (!track || downloaded || dlProgress !== undefined) return;
+    void DownloadService.startDownload(track);
+    // Close right away; TrackRow shows a spinner while it runs.
+    Keyboard.dismiss();
+    setCreating(false);
+    setNewName('');
+    onClose();
+  }, [track, downloaded, dlProgress, onClose]);
+
+  const handleDelete = useCallback(() => {
+    if (!track) return;
+    onDelete?.(track);
+    onClose();
+  }, [track, onDelete, onClose]);
 
   /** Newest-first, matching how Library orders them. */
   const ordered = useMemo(
@@ -119,10 +154,12 @@ export const AddToPlaylistSheet: React.FC<Props> = ({ track, onClose }) => {
       >
         <View style={styles.header}>
           <View style={styles.headerText}>
-            <Text style={styles.title}>Add to playlist</Text>
+            <Text style={styles.title} numberOfLines={1}>
+              {track?.title ?? 'Options'}
+            </Text>
             {!!track && (
               <Text style={styles.subtitle} numberOfLines={1}>
-                {track.title}
+                {track.artist.name}
               </Text>
             )}
           </View>
@@ -130,6 +167,32 @@ export const AddToPlaylistSheet: React.FC<Props> = ({ track, onClose }) => {
             <X color={COLORS.text.secondary} size={22} />
           </TouchableOpacity>
         </View>
+
+        {onDelete ? (
+          <TouchableOpacity style={styles.row} activeOpacity={0.7} onPress={handleDelete}>
+            <View style={styles.rowIcon}>
+              <Trash2 color={COLORS.accent.red} size={20} />
+            </View>
+            <Text style={[styles.rowLabel, { color: COLORS.accent.red }]}>
+              Delete download
+            </Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity
+            style={styles.row}
+            activeOpacity={0.7}
+            onPress={handleDownload}
+            disabled={downloaded || dlProgress !== undefined}
+          >
+            <View style={styles.rowIcon}>
+              <Download color={COLORS.text.primary} size={20} />
+            </View>
+            <Text style={styles.rowLabel}>
+              {downloaded ? 'Downloaded' : dlProgress !== undefined ? 'Downloading…' : 'Download'}
+            </Text>
+            {downloaded && <Check color={COLORS.accent.green} size={18} />}
+          </TouchableOpacity>
+        )}
 
         {creating ? (
           <View style={styles.createRow}>

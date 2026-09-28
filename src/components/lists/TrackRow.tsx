@@ -7,7 +7,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
 } from 'react-native';
-import { MoreVertical, Download, Check } from 'lucide-react-native';
+import { MoreVertical } from 'lucide-react-native';
 import { Track } from '../../core/types';
 import { COLORS, SIZES, FONTS } from '../../constants/theme';
 import { DownloadService } from '../../services/DownloadService';
@@ -35,27 +35,18 @@ const TrackRowComponent: React.FC<TrackRowProps> = ({
     [onMorePress, track]
   );
 
-  // Live download status for this one row -- DownloadService is a global
-  // singleton, so each row subscribes independently rather than needing a
-  // context provider just for this.
-  const [downloaded, setDownloaded] = useState(() => DownloadService.isDownloaded(track.id));
+  // Download itself now lives in the 3-dot menu (AddToPlaylistSheet); the row
+  // only shows a small spinner while this track is downloading, since the
+  // menu has already closed by then.
   const [progress, setProgress] = useState<number | undefined>(() =>
     DownloadService.getProgress(track.id)
   );
 
   useEffect(() => {
-    const sync = () => {
-      setDownloaded(DownloadService.isDownloaded(track.id));
-      setProgress(DownloadService.getProgress(track.id));
-    };
+    const sync = () => setProgress(DownloadService.getProgress(track.id));
     sync();
     return DownloadService.subscribe(sync);
   }, [track.id]);
-
-  const handleDownloadPress = useCallback(() => {
-    if (downloaded || progress !== undefined) return; // already saved, or in progress
-    void DownloadService.startDownload(track);
-  }, [downloaded, progress, track]);
 
   return (
     <TouchableOpacity
@@ -78,22 +69,10 @@ const TrackRowComponent: React.FC<TrackRowProps> = ({
         </Text>
       </View>
 
-      {progress !== undefined ? (
+      {progress !== undefined && (
         <View style={styles.downloadButton}>
           <ActivityIndicator size="small" color={COLORS.text.secondary} />
         </View>
-      ) : (
-        <TouchableOpacity
-          style={styles.downloadButton}
-          onPress={handleDownloadPress}
-          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-        >
-          {downloaded ? (
-            <Check color={COLORS.accent.green} size={18} />
-          ) : (
-            <Download color={COLORS.text.secondary} size={18} />
-          )}
-        </TouchableOpacity>
       )}
 
       {isLoading ? (
