@@ -376,7 +376,7 @@ const styles = StyleSheet.create({
   section: { marginTop: SIZES.xl },
   // First section sits right under the "Home" title -- the normal section
   // gap plus the header's own padding left a big dead band there.
-  firstSection: { marginTop: SIZES.sm },
+  firstSection: { marginTop: SIZES.md },
   sectionTitle: {
     fontFamily: FONTS.bold,
     fontSize: 20,
