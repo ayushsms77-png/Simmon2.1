@@ -36,13 +36,14 @@ type SectionDef = {
   limit?: number;
 };
 
-/** The exact 11-section home map, in order. */
+/** The exact 12-section home map, in order. */
 const SECTIONS: SectionDef[] = [
   { key: 'madeForYou', title: 'Made For You', kind: 'search', layout: 'h', query: 'pop hits', cardSize: 210, radius: SIZES.radius.lg },
   { key: 'recentlyPlayed', title: 'Recently Played', kind: 'history', layout: 'h', cardSize: 168, radius: SIZES.radius.lg },
   { key: 'quickPicks', title: 'Quick Picks', kind: 'search', layout: 'grid', query: 'top hits playlist', limit: 6 },
   { key: 'trending', title: 'Trending Now', kind: 'search', layout: 'h', query: 'top global chart songs', cardSize: 128, radius: SIZES.radius.md },
-  { key: 'loveSongs', title: 'Love Songs', kind: 'search', layout: 'h', query: 'best romantic hindi songs', cardSize: 128, radius: SIZES.radius.md },
+  { key: 'loveSongs', title: 'Romantic Songs', kind: 'search', layout: 'h', query: 'best romantic hindi songs', cardSize: 128, radius: SIZES.radius.md },
+  { key: 'partyHits', title: 'Party Hits', kind: 'search', layout: 'h', query: 'best party songs hindi punjabi', cardSize: 128, radius: SIZES.radius.md },
   { key: 'oldGold', title: 'Bollywood Old Gold', kind: 'search', layout: 'h', query: 'old bollywood classic hits', cardSize: 128, radius: SIZES.radius.md },
   { key: 'popularAlbums', title: 'Popular Albums', kind: 'albums', layout: 'h', query: 'popular bollywood albums', cardSize: 150, radius: SIZES.radius.lg },
   { key: 'newReleases', title: 'New Releases', kind: 'search', layout: 'h', query: 'new music releases', cardSize: 150, radius: SIZES.radius.lg },
@@ -265,14 +266,14 @@ export default function HomeScreen() {
           </TouchableOpacity>
         </View>
 
-        {SECTIONS.map((s) => {
+        {SECTIONS.map((s, idx) => {
           const data = dataFor(s);
           const pending = loading && (s.kind === 'search' || s.kind === 'albums' || s.kind === 'related');
           if (data.length === 0 && !pending) return null; // hide empty sections entirely
           const isAlbums = s.kind === 'albums';
 
           return (
-            <View key={s.key} style={styles.section}>
+            <View key={s.key} style={[styles.section, idx === 0 && styles.firstSection]}>
               <Text style={styles.sectionTitle}>{s.title}</Text>
 
               {s.layout === 'h' && (
@@ -363,7 +364,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: SIZES.md,
-    paddingBottom: SIZES.md,
+    paddingBottom: 0,
     marginTop: SIZES.md,
   },
   headerTitle: {
@@ -373,6 +374,9 @@ const styles = StyleSheet.create({
     letterSpacing: -0.5,
   },
   section: { marginTop: SIZES.xl },
+  // First section sits right under the "Home" title -- the normal section
+  // gap plus the header's own padding left a big dead band there.
+  firstSection: { marginTop: SIZES.sm },
   sectionTitle: {
     fontFamily: FONTS.bold,
     fontSize: 20,

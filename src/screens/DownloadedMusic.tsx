@@ -9,6 +9,7 @@ import { usePlayer } from '../hooks/usePlayer';
 import { DownloadService } from '../services/DownloadService';
 import { TrackRow } from '../components/lists/TrackRow';
 import { MiniPlayer } from '../components/player/MiniPlayer';
+import { AddToPlaylistSheet } from '../components/lists/AddToPlaylistSheet';
 
 export default function DownloadedMusicScreen() {
   const insets = useSafeAreaInsets();
@@ -23,6 +24,8 @@ export default function DownloadedMusicScreen() {
     void DownloadService.load().then(() => setTracks(DownloadService.getDownloaded()));
     return DownloadService.subscribe(() => setTracks(DownloadService.getDownloaded()));
   }, []);
+
+  const [addingTrack, setAddingTrack] = useState<Track | null>(null);
 
   const playFrom = (track: Track) => playTrack(track, { tracks, label: 'Downloaded Music' });
 
@@ -60,12 +63,18 @@ export default function DownloadedMusicScreen() {
               key={track.id}
               track={track}
               onPress={playFrom}
-              onMorePress={removeDownload}
+              onMorePress={setAddingTrack}
               isPlaying={currentTrack?.id === track.id && isPlaying}
             />
           ))}
         </View>
       )}
+
+      <AddToPlaylistSheet
+        track={addingTrack}
+        onClose={() => setAddingTrack(null)}
+        onDelete={removeDownload}
+      />
 
       {currentTrack && (
         <MiniPlayer
